@@ -214,9 +214,10 @@
         return;
       }
       setStatus('正在查询德语词典…');
-      const lookupWord=word.charAt(0).toLocaleUpperCase('de-DE')+word.slice(1);
+      const capitalized=word.charAt(0).toLocaleUpperCase('de-DE')+word.slice(1);
       try{
-        const found=await queryWiktionary(lookupWord);
+        let found=await queryWiktionary(word);
+        if(!found&&capitalized!==word)found=await queryWiktionary(capitalized);
         if(request!==suggestionVersion||document.getElementById('f-word')?.value!==stableWord)return;
         if(!found){setStatus('词典暂无可靠结果；可手动填写');return}
         const n=fill(found);
