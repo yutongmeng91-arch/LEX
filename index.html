@@ -145,20 +145,84 @@
   const mine=db.items.filter(i=>i.type==='sentence');
   return `<div class="page-head"><div class="eyebrow">SENTENCE PATTERNS</div><h1>句型练习</h1><div class="sub">先用10组基础句型开始。每组有例句、语法提示和替换练习。</div></div><div class="pat-grid">${BASIC_PATTERNS.map((p,i)=>`<button class="pat-item" data-pattern="${i}"><span class="pat-count">${String(i+1).padStart(2,'0')}</span><span class="pat-desc"><b>${safe(p.title)}</b><small>${safe(p.tag)} · 已答对 ${db.patternStats?.[i]?.correct||0} 题</small></span><span class="pat-arrow">›</span></button>`).join('')}</div><div class="section"><div class="section-header"><h2>我收藏的句子</h2><button class="btn soft small" data-action="add-sentence">＋ 添加</button></div>${mine.length?`<div class="list">${mine.map(entryHTML).join('')}</div>`:`<div class="mini-note">你也可以收藏遇到的句子，慢慢搭建自己的句型库。</div>`}</div>`;
 }
-    function suggestWord(){
-  const box=document.getElementById('f-word');if(!box)return;
-  const raw=box.value.trim(),parts=raw.match(/^(der|die|das)\s+(.+)$/i),w=parts?parts[2].trim():raw;
-  if(!w)return;
-  const status=document.getElementById('word-suggestion'),found=WORD_SUGGEST[w.toLocaleLowerCase('de-DE')];
-  if(parts){const art=document.getElementById('f-article');if(art&&!art.value)art.value=parts[1].toLowerCase();box.value=w}
-  if(!found){if(status)status.textContent='暂未收录这个词，可手动填写';return}
-  let changed=0;
-  for(const k of ['article','translation','plural']){
-    const f=document.getElementById('f-'+k);
-    if(f&&!String(f.value).trim()&&found[k]){f.value=found[k];changed++}
-  }
-  if(status)status.textContent=changed?'已补全空白字段，可随时修改':'已找到词典资料，你填的内容保持不变';
-}
+
+    let suggestionVersion=0;
+    function cleanWiktionaryPlural(value){
+      let v=String(value||'').split('\n')[0].replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g,'$1').replace(/<[^>]+>/g,'').replace(/'{2,}/g,'').trim();
+      if(v.length>65||/[{}<>]/.test(v)||/^(?:-|—|–|kein Plural|ohne Plural|\?)$/i.test(v))return '';
+      return v;
+    }
+    function parseGermanEntry(raw){
+      const start=raw.search(/^==[^\n]*\{\{Sprache\|Deutsch\}\}[^\n]*==/im);
+      if(start<0)return null;
+      const tail=raw.slice(start),next=tail.slice(3).search(/^==[^\n]*\{\{Sprache\|[^}]+\}\}[^\n]*==/im);
+      const german=next<0?tail:tail.slice(0,next+3);
+      const nouns=[...german.matchAll(/\{\{Wortart\|Substantiv\|Deutsch\}\}([^\n]{0,160})/g)];
+      if(nouns.length){
+        const genders=nouns.map(m=>/\{\{([mfn])\}\}/.exec(m[1])?.[1]).filter(Boolean);
+        if(!genders.length)return null;
+        const distinct=[...new Set(genders)];
+        if(distinct.length>1)return {ambiguous:true};
+        const first=nouns[0].index,detail=german.slice(first,first+2000);
+        const plural=/\|\s*Nominativ Plural\s*=\s*([^\n|}]+)/i.exec(detail);
+        return {article:{m:'der',f:'die',n:'das'}[distinct[0]],plural:cleanWiktionaryPlural(plural?.[1]),pos:'名词'};
+      }
+      if(/\{\{Wortart\|Verb\|Deutsch\}\}/.test(german))return {pos:'动词'};
+      if(/\{\{Wortart\|Adjektiv\|Deutsch\}\}/.test(german))return {pos:'形容词'};
+      if(/\{\{Wortart\|Adverb\|Deutsch\}\}/.test(german))return {pos:'副词'};
+      return null;
+    }
+    async function queryWiktionary(word){
+      const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),6500);
+      try{
+        const q=new URLSearchParams({action:'parse',page:word,prop:'wikitext',format:'json',origin:'*'});
+        const resp=await fetch('https://de.wiktionary.org/w/api.php?'+q.toString(),{signal:controller.signal,credentials:'omit'});
+        if(!resp.ok)throw new Error('HTTP '+resp.status);
+        const json=await resp.json();
+        const content=json.parse?.wikitext?.['*'];
+        return typeof content==='string'?parseGermanEntry(content):null;
+      }finally{clearTimeout(timeout)}
+    }
+    async function suggestWord(){
+      const box=document.getElementById('f-word');if(!box)return;
+      const raw=box.value.trim(),parts=raw.match(/^(der|die|das)\s+(.+)$/i),word=parts?parts[2].trim():raw,request=++suggestionVersion;
+      if(!word){const info=document.getElementById('word-suggestion');if(info)info.textContent='输入德语单词后自动尝试补全';return}
+      const status=document.getElementById('word-suggestion');
+      if(parts){
+        const article=document.getElementById('f-article');if(article&&!article.value)article.value=parts[1].toLowerCase();
+        box.value=word;
+      }
+      const stableWord=box.value;
+      const setStatus=t=>{const el=document.getElementById('word-suggestion');if(el&&request===suggestionVersion)el.textContent=t};
+      const fill=suggestion=>{
+        if(!suggestion||request!==suggestionVersion||document.getElementById('f-word')?.value!==stableWord)return 0;
+        if(suggestion.ambiguous){setStatus('这个词有多种词性或性别，请根据词义手动选择');return 0}
+        const articleEl=document.getElementById('f-article');
+        if(articleEl?.value&&suggestion.article&&articleEl.value!==suggestion.article){setStatus('你填写的冠词与查询结果不同，请核对词义');return 0}
+        let count=0;
+        for(const k of ['article','translation','plural','pos']){
+          const el=document.getElementById('f-'+k);
+          if(el&&!String(el.value).trim()&&suggestion[k]){el.value=suggestion[k];count++}
+        }
+        return count;
+      };
+      const entry=WORD_SUGGEST[word.toLocaleLowerCase('de-DE')];
+      if(entry){
+        const n=fill({...entry,pos:entry.article?'名词':''});
+        if(n)setStatus('已自动补全，可手动修改');
+        else if(!status?.textContent?.includes('不同'))setStatus('已找到词典建议，保留你填写的内容');
+        return;
+      }
+      setStatus('正在查询德语词典…');
+      const lookupWord=word.charAt(0).toLocaleUpperCase('de-DE')+word.slice(1);
+      try{
+        const found=await queryWiktionary(lookupWord);
+        if(request!==suggestionVersion||document.getElementById('f-word')?.value!==stableWord)return;
+        if(!found){setStatus('词典暂无可靠结果；可手动填写');return}
+        const n=fill(found);
+        if(!found.ambiguous)setStatus(n?'已补充词性/冠词等；中文释义可自己填写':'已查询；请核对或手动填写');
+      }catch(e){setStatus('在线词典暂时不可用，请手动填写或稍后重试')}
+    }
     function checkPattern(reveal=false){
   if(chosenPattern===null||practiceResult)return;
   const input=document.getElementById('pattern-input'),typed=String(input?.value||'').trim();
@@ -169,7 +233,7 @@
   if(correct){const n=db.patternStats[chosenPattern]||{correct:0};n.correct++;db.patternStats[chosenPattern]=n;store()}
   render();
 }
-    function renderModal(){if(!modal)return '';const i=modal.id?itemById(modal.id):{type:modal.type};if(!i)return '';let fields='';if(i.type==='word')fields=`${input('word','德语单词 *',i.word,'required placeholder="例如 Bruder"')}<div class="word-hint"><small id="word-suggestion">输入单词后尝试补全；也可以自己填写</small><button class="btn soft small" type="button" data-action="word-suggest">✦ 补全</button></div><div class="fieldrow">${select('article','定冠词',[['','无／暂不填写'],['der','der · 阳性'],['die','die · 阴性'],['das','das · 中性']],i.article||'')}${select('pos','词性',[['名词','名词'],['动词','动词'],['形容词','形容词'],['副词','副词'],['其他','其他']],i.pos||'其他')}</div>${input('translation','中文意思 *',i.translation,'required placeholder="例如 兄弟"')}${input('plural','复数形式（可选）',i.plural,'placeholder="例如 Brüder"')}${area('example','例句（可选）',i.example)}${area('note','其他笔记（可选）',i.note)}`;
+    function renderModal(){if(!modal)return '';const i=modal.id?itemById(modal.id):{type:modal.type};if(!i)return '';let fields='';if(i.type==='word')fields=`${input('word','德语单词 *',i.word,'required placeholder="例如 Bruder"')}<div class="word-hint"><small id="word-suggestion">输入常见词自动补全，其他词尝试在线查词典</small><button class="btn soft small" type="button" data-action="word-suggest">✦ 补全</button></div><div class="fieldrow">${select('article','定冠词',[['','无／暂不填写'],['der','der · 阳性'],['die','die · 阴性'],['das','das · 中性']],i.article||'')}${select('pos','词性',[['','选择词性'],['名词','名词'],['动词','动词'],['形容词','形容词'],['副词','副词'],['其他','其他']],i.pos||'')}</div>${input('translation','中文意思 *',i.translation,'required placeholder="例如 兄弟"')}${input('plural','复数形式（可选）',i.plural,'placeholder="例如 Brüder"')}${area('example','例句（可选）',i.example)}${area('note','其他笔记（可选）',i.note)}`;
       if(i.type==='sentence')fields=`${area('german','德语句子 *',i.german)}${area('translation','中文意思 *',i.translation)}${area('note','语法观察 / 使用场景（可选）',i.note,'可以先写一句简单的发现，将来再整理到语法本。')}`;
       if(i.type==='grammar')fields=`${input('title','语法主题 *',i.title,'required placeholder="例如 人称代词第四格"')}${area('explanation','你的理解 / 规则 *',i.explanation,'不必一次写完整，随着学习随时回来补充。')}${area('example','例句（可选）',i.example)}${input('tag','分类（可选）',i.tag,'placeholder="例如 格、语序、动词"')}`;
       return `<div class="modal-wrap" id="modal-wrap"><section class="modal" role="dialog" aria-modal="true" aria-label="编辑学习卡"><div class="modal-title"><h2>${modal.id?'编辑':'新增'}${TYPES[i.type]}</h2><button class="iconbtn" data-action="modal-close" aria-label="关闭">×</button></div><div class="hintbox">${i.type==='word'?'德语名词尽量和 der / die / das 一起记。':i.type==='sentence'?'先把你真的读到、说过的句子留下来。':'语法不必一次弄懂，可以反复修改。'}</div><form id="entry-form"><div class="row-between" style="margin-top:13px"><span class="word-count">德语特殊字母</span><span>${['ä','ö','ü','ß','Ä','Ö','Ü'].map(x=>`<button type="button" class="shortcut" data-insert="${x}">${x}</button>`).join('')}</span></div>${fields}<div class="modal-actions"><button class="btn outline" type="button" data-action="modal-close">取消</button><button class="btn primary" type="submit">保存并加入复习</button></div></form></section></div>`}
@@ -179,10 +243,10 @@
     function exportData(){const blob=new Blob([JSON.stringify({...db,exportedAt:new Date().toISOString()},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`Lex-backup-${today()}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);message('备份文件已生成')}
     function importData(file){if(!file)return;const rd=new FileReader();rd.onload=()=>{try{const d=JSON.parse(rd.result);if(!d||!Array.isArray(d.items)||!Array.isArray(d.logs)||d.items.length>50000||d.items.some(x=>!x.id||!TYPES[x.type]))throw Error('格式不符合预期');if(!confirm(`要恢复 ${d.items.length} 张卡片吗？这会替换本机目前的全部内容。`))return;db={version:1,items:d.items,logs:d.logs,settings:{goal:10,reverse:false,...(d.settings||{})}};store();page='today';search='';filter='all';render();message('备份恢复成功')}catch(e){message('导入失败：请选择本应用导出的 JSON 文件')}};rd.readAsText(file)}
     document.addEventListener('click',e=>{const button=e.target.closest('button');if(!button)return;const a=button.dataset.action;if(button.dataset.page){page=button.dataset.page;if(page==='sentence')chosenPattern=null;search='';filter='all';window.scrollTo(0,0);render();return}if(button.dataset.filter){filter=button.dataset.filter;render();return}if(button.dataset.speak===undefined&&button.dataset.say){const i=itemById(button.dataset.say);if(i)say(i.type==='word'?entryTitle(i):i.type==='sentence'?i.german:(i.example||''));return}if(button.dataset.edit){const i=itemById(button.dataset.edit);if(i)openEditor(i.type,i.id);return}if(button.dataset.delete){const i=itemById(button.dataset.delete);if(i&&confirm(`确定要删除「${entryTitle(i)}」吗？`)){db.items=db.items.filter(x=>x.id!==i.id);store();render();message('已删除')}return}if(button.dataset.grade){grade(button.dataset.grade);return}if(button.dataset.pattern!==undefined){chosenPattern=Number(button.dataset.pattern);practiceIndex=0;practiceResult=null;render();window.scrollTo(0,0);return}if(button.dataset.insert){const active=document.activeElement;const target=active&&(active.tagName==='INPUT'||active.tagName==='TEXTAREA')?active:document.querySelector('#f-word, #f-german, #f-title');if(target){const a=target.selectionStart??target.value.length,b=target.selectionEnd??a;target.setRangeText(button.dataset.insert,a,b,'end');target.focus()}return}
-      switch(a){case'word-suggest':clearTimeout(wordTimer);suggestWord();break;case'open-patterns':page='sentence';chosenPattern=null;render();window.scrollTo(0,0);break;case'open-grammar':page='grammar';render();window.scrollTo(0,0);break;case'patterns-back':chosenPattern=null;practiceResult=null;render();break;case'pattern-check':checkPattern();break;case'pattern-reveal':checkPattern(true);break;case'pattern-next':practiceIndex++;practiceResult=null;render();document.getElementById('pattern-input')?.focus();break;case'add-word':openEditor('word');break;case'add-sentence':openEditor('sentence');break;case'add-grammar':openEditor('grammar');break;case'start':startSession();break;case'revisit':{const ids=db.items.map(i=>i.id);if(!ids.length){message('先添加一个单词或句子吧');break}session={queue:ids,index:0,initial:ids.length,completed:0};showAnswer=false;render();break}case'reveal':showAnswer=true;render();break;case'review-end':session=null;render();break;case'modal-close':modal=null;render();break;case'export':exportData();break;case'import':document.getElementById('importfile')?.click();break;case'save-goal':{const n=Number(document.getElementById('goal')?.value);if(!Number.isInteger(n)||n<1||n>200){message('请输入 1 到 200 之间的数字');return}db.settings.goal=n;store();render();message('复习目标已更新');break}case'reset':if(confirm('确定删除本机所有单词、句子、语法和复习记录吗？这无法撤销。建议先导出备份。')){db={version:1,items:[],logs:[],settings:{goal:10,reverse:false}};page='today';store();render();message('本机记录已清空')}break;}
+      switch(a){case'word-suggest':clearTimeout(wordTimer);suggestionVersion++;suggestWord();break;case'open-patterns':page='sentence';chosenPattern=null;render();window.scrollTo(0,0);break;case'open-grammar':page='grammar';render();window.scrollTo(0,0);break;case'patterns-back':chosenPattern=null;practiceResult=null;render();break;case'pattern-check':checkPattern();break;case'pattern-reveal':checkPattern(true);break;case'pattern-next':practiceIndex++;practiceResult=null;render();document.getElementById('pattern-input')?.focus();break;case'add-word':openEditor('word');break;case'add-sentence':openEditor('sentence');break;case'add-grammar':openEditor('grammar');break;case'start':startSession();break;case'revisit':{const ids=db.items.map(i=>i.id);if(!ids.length){message('先添加一个单词或句子吧');break}session={queue:ids,index:0,initial:ids.length,completed:0};showAnswer=false;render();break}case'reveal':showAnswer=true;render();break;case'review-end':session=null;render();break;case'modal-close':modal=null;render();break;case'export':exportData();break;case'import':document.getElementById('importfile')?.click();break;case'save-goal':{const n=Number(document.getElementById('goal')?.value);if(!Number.isInteger(n)||n<1||n>200){message('请输入 1 到 200 之间的数字');return}db.settings.goal=n;store();render();message('复习目标已更新');break}case'reset':if(confirm('确定删除本机所有单词、句子、语法和复习记录吗？这无法撤销。建议先导出备份。')){db={version:1,items:[],logs:[],settings:{goal:10,reverse:false}};page='today';store();render();message('本机记录已清空')}break;}
     });
     document.addEventListener('submit',e=>{if(e.target.id==='entry-form'){e.preventDefault();saveEditor(e.target)}});
-    document.addEventListener('input',e=>{if(e.target.id==='f-word'){clearTimeout(wordTimer);wordTimer=setTimeout(suggestWord,650)}if(e.target.id==='search'){search=e.target.value;const items=db.items.filter(i=>i.type===page).filter(i=>{const q=search.toLowerCase();return [entryTitle(i),entryAnswer(i),i.example,i.note,i.tag,i.plural].some(s=>String(s||'').toLowerCase().includes(q))}).filter(i=>filter==='all'||(filter==='due'?due(i):!!i.review?.reps));document.getElementById('entries').innerHTML=items.length?items.map(entryHTML).join(''):empty('🔎','没有找到相关内容','试试其他关键词。','','')}});
+    document.addEventListener('input',e=>{if(e.target.id==='f-word'){suggestionVersion++;clearTimeout(wordTimer);wordTimer=setTimeout(suggestWord,750)}if(e.target.id==='search'){search=e.target.value;const items=db.items.filter(i=>i.type===page).filter(i=>{const q=search.toLowerCase();return [entryTitle(i),entryAnswer(i),i.example,i.note,i.tag,i.plural].some(s=>String(s||'').toLowerCase().includes(q))}).filter(i=>filter==='all'||(filter==='due'?due(i):!!i.review?.reps));document.getElementById('entries').innerHTML=items.length?items.map(entryHTML).join(''):empty('🔎','没有找到相关内容','试试其他关键词。','','')}});
     document.addEventListener('change',e=>{if(e.target.id==='reverse'){db.settings.reverse=e.target.checked;store();message(e.target.checked?'已开启反向复习':'已关闭反向复习')}if(e.target.id==='importfile'){importData(e.target.files?.[0]);e.target.value=''}});
     document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='pattern-input'){e.preventDefault();checkPattern();return}if(e.key==='Escape'&&modal){modal=null;render()}});
     store();render();
